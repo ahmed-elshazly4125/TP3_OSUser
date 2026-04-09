@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -16,15 +17,14 @@
 #define PORT 9998
 #define LBUF 512
 
-participant_t table[MAX_USERS];
-int nb_participants = 0;
+struct elt *liste_contacts = NULL;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t g_th_udp;
 static int g_udp_actif = 0;
 static int g_udp_sid = -1;
 static volatile int g_stop_udp = 0;
-static char g_udp_pseudo[256];
+static char g_udp_pseudo[LPSEUDO + 1];
 
 char *addrip(unsigned long A)
 {
@@ -48,66 +48,6 @@ int message_beuip_valide(const char *msg, int n)
     return 1;
 }
 
-int deja_present(unsigned long ip, const char *pseudo)
-{
-    int i;
-
-    for (i = 0; i < nb_participants; i++) {
-        if (table[i].ip == ip && strcmp(table[i].pseudo, pseudo) == 0)
-            return 1;
-    }
-
-    return 0;
-}
-
-void ajouter_participant(unsigned long ip, const char *pseudo)
-{
-    if (deja_present(ip, pseudo))
-        return;
-
-    if (nb_participants >= MAX_USERS) {
-        fprintf(stderr, "Table pleine, impossible d'ajouter %s (%s)\n",
-                pseudo, addrip(ip));
-        return;
-    }
-
-    table[nb_participants].ip = ip;
-    strncpy(table[nb_participants].pseudo, pseudo,
-            sizeof(table[nb_participants].pseudo) - 1);
-    table[nb_participants].pseudo[sizeof(table[nb_participants].pseudo) - 1] = '\0';
-    nb_participants++;
-}
-
-void supprimer_participant(unsigned long ip, const char *pseudo)
-{
-    int i;
-
-    for (i = 0; i < nb_participants; i++) {
-        if (table[i].ip == ip && strcmp(table[i].pseudo, pseudo) == 0) {
-            int j;
-            for (j = i; j < nb_participants - 1; j++) {
-                table[j] = table[j + 1];
-            }
-            nb_participants--;
-            return;
-        }
-    }
-}
-
-void afficher_table(void)
-{
-    int i;
-
-    printf("---- Table des participants ----\n");
-    for (i = 0; i < nb_participants; i++) {
-        printf("%2d : %s - %s\n",
-               i + 1,
-               addrip(table[i].ip),
-               table[i].pseudo);
-    }
-    printf("-------------------------------\n");
-}
-
 void construire_message(char *dest, char code, const char *pseudo)
 {
     dest[0] = code;
@@ -120,30 +60,176 @@ int taille_message_beuip(const char *pseudo)
     return 6 + strlen(pseudo) + 1;
 }
 
-int chercher_ip_par_pseudo(const char *pseudo, unsigned long *ip)
+static void videListe(void)
 {
-    int i;
+    struct elt *cour;
+    struct elt *suiv;
 
-    for (i = 0; i < nb_participants; i++) {
-        if (strcmp(table[i].pseudo, pseudo) == 0) {
-            *ip = table[i].ip;
+    pthread_mutex_lock(&mutex_table);
+    cour = liste_contacts;
+    while (cour != NULL) {
+        suiv = cour->next;
+        free(cour);
+        cour = suiv;
+    }
+    liste_contacts = NULL;
+    pthread_mutex_unlock(&mutex_table);
+}
+
+void ajouteElt(char *pseudo, char *adip)
+{
+    struct elt *nv;
+    struct elt **pp;
+    struct elt *cour;
+
+    if (pseudo == NULL || adip == NULL)
+        return;
+
+    pthread_mutex_lock(&mutex_table);
+
+    cour = liste_contacts;
+    while (cour != NULL) {
+        if (strcmp(cour->adip, adip) == 0) {
+            strncpy(cour->nom, pseudo, LPSEUDO);
+            cour->nom[LPSEUDO] = '\0';
+            pthread_mutex_unlock(&mutex_table);
+            return;
+        }
+        cour = cour->next;
+    }
+
+    nv = malloc(sizeof(struct elt));
+    if (nv == NULL) {
+        perror("malloc");
+        pthread_mutex_unlock(&mutex_table);
+        return;
+    }
+
+    strncpy(nv->nom, pseudo, LPSEUDO);
+    nv->nom[LPSEUDO] = '\0';
+    strncpy(nv->adip, adip, 15);
+    nv->adip[15] = '\0';
+    nv->next = NULL;
+
+    pp = &liste_contacts;
+    while (*pp != NULL) {
+        int c = strcmp((*pp)->nom, nv->nom);
+        if (c > 0)
+            break;
+        if (c == 0 && strcmp((*pp)->adip, nv->adip) > 0)
+            break;
+        pp = &((*pp)->next);
+    }
+
+    nv->next = *pp;
+    *pp = nv;
+
+    pthread_mutex_unlock(&mutex_table);
+}
+
+void supprimeElt(char *adip)
+{
+    struct elt **pp;
+    struct elt *tmp;
+
+    if (adip == NULL)
+        return;
+
+    pthread_mutex_lock(&mutex_table);
+
+    pp = &liste_contacts;
+    while (*pp != NULL) {
+        if (strcmp((*pp)->adip, adip) == 0) {
+            tmp = *pp;
+            *pp = (*pp)->next;
+            free(tmp);
+            pthread_mutex_unlock(&mutex_table);
+            return;
+        }
+        pp = &((*pp)->next);
+    }
+
+    pthread_mutex_unlock(&mutex_table);
+}
+
+void listeElts(void)
+{
+    struct elt *cour;
+
+    pthread_mutex_lock(&mutex_table);
+
+    printf("---- Liste des contacts ----\n");
+    cour = liste_contacts;
+    while (cour != NULL) {
+        printf("%s - %s\n", cour->nom, cour->adip);
+        cour = cour->next;
+    }
+    printf("----------------------------\n");
+
+    pthread_mutex_unlock(&mutex_table);
+}
+
+static struct elt *chercheEltParNom_locked(const char *pseudo)
+{
+    struct elt *cour = liste_contacts;
+
+    while (cour != NULL) {
+        if (strcmp(cour->nom, pseudo) == 0)
+            return cour;
+        cour = cour->next;
+    }
+
+    return NULL;
+}
+
+static struct elt *chercheEltParIp_locked(const char *adip)
+{
+    struct elt *cour = liste_contacts;
+
+    while (cour != NULL) {
+        if (strcmp(cour->adip, adip) == 0)
+            return cour;
+        cour = cour->next;
+    }
+
+    return NULL;
+}
+
+static int ip_est_locale(const char *adip)
+{
+    struct ifaddrs *ifaddr;
+    struct ifaddrs *ifa;
+    char host[NI_MAXHOST];
+
+    if (strcmp(adip, "127.0.0.1") == 0)
+        return 1;
+
+    if (getifaddrs(&ifaddr) == -1)
+        return 0;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        if (getnameinfo(ifa->ifa_addr,
+                        sizeof(struct sockaddr_in),
+                        host, sizeof(host),
+                        NULL, 0,
+                        NI_NUMERICHOST) != 0) {
+            continue;
+        }
+
+        if (strcmp(host, adip) == 0) {
+            freeifaddrs(ifaddr);
             return 1;
         }
     }
 
+    freeifaddrs(ifaddr);
     return 0;
-}
-
-char *chercher_pseudo_par_ip(unsigned long ip)
-{
-    int i;
-
-    for (i = 0; i < nb_participants; i++) {
-        if (table[i].ip == ip)
-            return table[i].pseudo;
-    }
-
-    return NULL;
 }
 
 static void envoie_broadcasts_identification(int sid, const char *pseudo)
@@ -214,7 +300,8 @@ void *serveur_udp(void *p)
     char reponse[LBUF + 1];
     char *pseudo_recu;
     char *texte;
-    char *pseudo_source;
+    char iptxt[16];
+    struct elt *elt_trouve;
     unsigned long ip_source;
     struct sockaddr_in SockConf;
     struct sockaddr_in Sock;
@@ -251,10 +338,7 @@ void *serveur_udp(void *p)
 
     printf("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
 
-    pthread_mutex_lock(&mutex_table);
-    ajouter_participant(0x7F000001, pseudo);
-    pthread_mutex_unlock(&mutex_table);
-
+    ajouteElt(pseudo, "127.0.0.1");
     envoie_broadcasts_identification(sid, pseudo);
 
     while (!g_stop_udp) {
@@ -270,6 +354,8 @@ void *serveur_udp(void *p)
 
         buf[n] = '\0';
         ip_source = ntohl(Sock.sin_addr.s_addr);
+        strncpy(iptxt, addrip(ip_source), sizeof(iptxt) - 1);
+        iptxt[sizeof(iptxt) - 1] = '\0';
 
         if (!message_beuip_valide(buf, n)) {
             printf("Message ignore : entete invalide\n");
@@ -278,19 +364,15 @@ void *serveur_udp(void *p)
 
         if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
             printf("Tentative de piratage ou code non autorise : %c depuis %s\n",
-                   buf[0], addrip(ip_source));
+                   buf[0], iptxt);
             continue;
         }
 
         if (buf[0] == '0') {
             pseudo_recu = buf + 6;
-
-            pthread_mutex_lock(&mutex_table);
-            printf("%s (%s) quitte le reseau.\n",
-                   pseudo_recu, addrip(ip_source));
-            supprimer_participant(ip_source, pseudo_recu);
-            afficher_table();
-            pthread_mutex_unlock(&mutex_table);
+            printf("%s (%s) quitte le reseau.\n", pseudo_recu, iptxt);
+            supprimeElt(iptxt);
+            listeElts();
             continue;
         }
 
@@ -298,26 +380,23 @@ void *serveur_udp(void *p)
             texte = buf + 6;
 
             pthread_mutex_lock(&mutex_table);
-            pseudo_source = chercher_pseudo_par_ip(ip_source);
-            if (pseudo_source == NULL) {
+            elt_trouve = chercheEltParIp_locked(iptxt);
+            if (elt_trouve == NULL) {
                 printf("Message recu d'une IP inconnue (%s) : %s\n",
-                       addrip(ip_source), texte);
+                       iptxt, texte);
             } else {
-                printf("Message de %s : %s\n", pseudo_source, texte);
+                printf("Message de %s : %s\n", elt_trouve->nom, texte);
             }
             pthread_mutex_unlock(&mutex_table);
-
             continue;
         }
 
         pseudo_recu = buf + 6;
-
-        pthread_mutex_lock(&mutex_table);
         printf("Message recu de %s : code=%c pseudo=%s\n",
-               addrip(ip_source), buf[0], pseudo_recu);
-        ajouter_participant(ip_source, pseudo_recu);
-        afficher_table();
-        pthread_mutex_unlock(&mutex_table);
+               iptxt, buf[0], pseudo_recu);
+
+        ajouteElt(pseudo_recu, iptxt);
+        listeElts();
 
         if (buf[0] == '1') {
             construire_message(reponse, '2', pseudo);
@@ -326,7 +405,7 @@ void *serveur_udp(void *p)
                        (struct sockaddr *)&Sock, ls) == -1) {
                 perror("sendto AR");
             } else {
-                printf("AR envoye a %s\n", addrip(ip_source));
+                printf("AR envoye a %s\n", iptxt);
             }
         }
     }
@@ -347,8 +426,10 @@ int beuip_start(const char *pseudo)
     if (g_udp_actif)
         return -1;
 
-    strncpy(g_udp_pseudo, pseudo, sizeof(g_udp_pseudo) - 1);
-    g_udp_pseudo[sizeof(g_udp_pseudo) - 1] = '\0';
+    videListe();
+
+    strncpy(g_udp_pseudo, pseudo, LPSEUDO);
+    g_udp_pseudo[LPSEUDO] = '\0';
 
     g_stop_udp = 0;
 
@@ -363,9 +444,9 @@ int beuip_start(const char *pseudo)
 
 int beuip_stop(void)
 {
-    int i;
     char message0[LBUF + 1];
     struct sockaddr_in Dest;
+    struct elt *cour;
 
     if (!g_udp_actif)
         return -1;
@@ -373,19 +454,20 @@ int beuip_stop(void)
     construire_message(message0, '0', g_udp_pseudo);
 
     pthread_mutex_lock(&mutex_table);
-    for (i = 0; i < nb_participants; i++) {
-        if (strcmp(table[i].pseudo, g_udp_pseudo) == 0)
-            continue;
+    cour = liste_contacts;
+    while (cour != NULL) {
+        if (!ip_est_locale(cour->adip)) {
+            memset(&Dest, 0, sizeof(Dest));
+            Dest.sin_family = AF_INET;
+            Dest.sin_port = htons(PORT);
+            Dest.sin_addr.s_addr = inet_addr(cour->adip);
 
-        memset(&Dest, 0, sizeof(Dest));
-        Dest.sin_family = AF_INET;
-        Dest.sin_port = htons(PORT);
-        Dest.sin_addr.s_addr = htonl(table[i].ip);
-
-        if (sendto(g_udp_sid, message0, taille_message_beuip(g_udp_pseudo), 0,
-                   (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
-            perror("sendto stop");
+            if (sendto(g_udp_sid, message0, taille_message_beuip(g_udp_pseudo), 0,
+                       (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+                perror("sendto stop");
+            }
         }
+        cour = cour->next;
     }
     pthread_mutex_unlock(&mutex_table);
 
@@ -397,6 +479,8 @@ int beuip_stop(void)
     }
 
     pthread_join(g_th_udp, NULL);
+    videListe();
+
     return 0;
 }
 
@@ -407,10 +491,10 @@ int beuip_actif(void)
 
 int commande(char octet1, char *message, char *pseudo)
 {
-    int i;
-    unsigned long ip_dest;
     char message9[LBUF + 1];
     struct sockaddr_in Dest;
+    struct elt *cour;
+    char ipdest[16];
 
     if (!g_udp_actif) {
         printf("Serveur UDP inactif.\n");
@@ -418,9 +502,7 @@ int commande(char octet1, char *message, char *pseudo)
     }
 
     if (octet1 == '3') {
-        pthread_mutex_lock(&mutex_table);
-        afficher_table();
-        pthread_mutex_unlock(&mutex_table);
+        listeElts();
         return 0;
     }
 
@@ -429,17 +511,21 @@ int commande(char octet1, char *message, char *pseudo)
             return -1;
 
         pthread_mutex_lock(&mutex_table);
-        if (!chercher_ip_par_pseudo(pseudo, &ip_dest)) {
+        cour = chercheEltParNom_locked(pseudo);
+        if (cour == NULL) {
             pthread_mutex_unlock(&mutex_table);
             printf("Pseudo inconnu : %s\n", pseudo);
             return -1;
         }
+
+        strncpy(ipdest, cour->adip, sizeof(ipdest) - 1);
+        ipdest[sizeof(ipdest) - 1] = '\0';
         pthread_mutex_unlock(&mutex_table);
 
         memset(&Dest, 0, sizeof(Dest));
         Dest.sin_family = AF_INET;
         Dest.sin_port = htons(PORT);
-        Dest.sin_addr.s_addr = htonl(ip_dest);
+        Dest.sin_addr.s_addr = inet_addr(ipdest);
 
         construire_message(message9, '9', message);
 
@@ -449,7 +535,7 @@ int commande(char octet1, char *message, char *pseudo)
             return -1;
         }
 
-        printf("Message prive envoye a %s (%s)\n", pseudo, addrip(ip_dest));
+        printf("Message prive envoye a %s (%s)\n", pseudo, ipdest);
         return 0;
     }
 
@@ -460,22 +546,23 @@ int commande(char octet1, char *message, char *pseudo)
         construire_message(message9, '9', message);
 
         pthread_mutex_lock(&mutex_table);
-        for (i = 0; i < nb_participants; i++) {
-            if (strcmp(table[i].pseudo, g_udp_pseudo) == 0)
-                continue;
+        cour = liste_contacts;
+        while (cour != NULL) {
+            if (!ip_est_locale(cour->adip)) {
+                memset(&Dest, 0, sizeof(Dest));
+                Dest.sin_family = AF_INET;
+                Dest.sin_port = htons(PORT);
+                Dest.sin_addr.s_addr = inet_addr(cour->adip);
 
-            memset(&Dest, 0, sizeof(Dest));
-            Dest.sin_family = AF_INET;
-            Dest.sin_port = htons(PORT);
-            Dest.sin_addr.s_addr = htonl(table[i].ip);
-
-            if (sendto(g_udp_sid, message9, taille_message_beuip(message), 0,
-                       (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
-                perror("sendto message collectif");
-            } else {
-                printf("Message collectif envoye a %s (%s)\n",
-                       table[i].pseudo, addrip(table[i].ip));
+                if (sendto(g_udp_sid, message9, taille_message_beuip(message), 0,
+                           (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+                    perror("sendto message collectif");
+                } else {
+                    printf("Message collectif envoye a %s (%s)\n",
+                           cour->nom, cour->adip);
+                }
             }
+            cour = cour->next;
         }
         pthread_mutex_unlock(&mutex_table);
 
