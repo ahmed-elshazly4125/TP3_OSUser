@@ -25,6 +25,8 @@ void supprimeElt(char *adip);
 void listeElts(void);
 
 void *serveur_udp(void *p);
+void *serveur_tcp(void *rep);
+
 int beuip_start(const char *pseudo);
 int beuip_stop(void);
 int beuip_actif(void);

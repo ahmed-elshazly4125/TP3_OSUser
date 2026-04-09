@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <net/if.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include "creme.h"
 
 #define PORT 9998
@@ -22,10 +23,19 @@ struct elt *liste_contacts = NULL;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t g_th_udp;
+static pthread_t g_th_tcp;
+
 static int g_udp_actif = 0;
+static int g_tcp_actif = 0;
+
 static int g_udp_sid = -1;
+static int g_tcp_sid = -1;
+
 static volatile int g_stop_udp = 0;
+static volatile int g_stop_tcp = 0;
+
 static char g_udp_pseudo[LPSEUDO + 1];
+static char g_reppub[256] = "reppub";
 
 char *addrip(unsigned long A)
 {
@@ -428,9 +438,104 @@ void *serveur_udp(void *p)
     return NULL;
 }
 
+void *serveur_tcp(void *rep)
+{
+    char *repertoire = (char *)rep;
+    int sid, fd, opt = 1, rc;
+    fd_set rset;
+    struct timeval tv;
+    struct sockaddr_in SockConf;
+    struct sockaddr_in Cli;
+    socklen_t lcli;
+    char ipcli[INET_ADDRSTRLEN];
+
+    if ((sid = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket TCP");
+        g_tcp_actif = 0;
+        return NULL;
+    }
+
+    g_tcp_sid = sid;
+
+    if (setsockopt(sid, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        perror("setsockopt SO_REUSEADDR");
+    }
+
+    memset(&SockConf, 0, sizeof(SockConf));
+    SockConf.sin_family = AF_INET;
+    SockConf.sin_port = htons(PORT);
+    SockConf.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sid, (struct sockaddr *)&SockConf, sizeof(SockConf)) == -1) {
+        perror("bind TCP");
+        close(sid);
+        g_tcp_sid = -1;
+        g_tcp_actif = 0;
+        return NULL;
+    }
+
+    if (listen(sid, 5) == -1) {
+        perror("listen");
+        close(sid);
+        g_tcp_sid = -1;
+        g_tcp_actif = 0;
+        return NULL;
+    }
+
+    printf("thread TCP lance sur le port %d avec le repertoire %s\n",
+           PORT, repertoire);
+
+    while (!g_stop_tcp) {
+        FD_ZERO(&rset);
+        FD_SET(sid, &rset);
+
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        rc = select(sid + 1, &rset, NULL, NULL, &tv);
+        if (rc < 0) {
+            if (g_stop_tcp)
+                break;
+            perror("select");
+            continue;
+        }
+
+        if (rc == 0)
+            continue;
+
+        if (FD_ISSET(sid, &rset)) {
+            lcli = sizeof(Cli);
+            fd = accept(sid, (struct sockaddr *)&Cli, &lcli);
+            if (fd < 0) {
+                if (g_stop_tcp)
+                    break;
+                perror("accept");
+                continue;
+            }
+
+            if (inet_ntop(AF_INET, &Cli.sin_addr, ipcli, sizeof(ipcli)) == NULL) {
+                strcpy(ipcli, "inconnue");
+            }
+
+            printf("Connexion TCP acceptee depuis %s\n", ipcli);
+            close(fd);
+        }
+    }
+
+    if (sid != -1)
+        close(sid);
+
+    g_tcp_sid = -1;
+    g_tcp_actif = 0;
+    g_stop_tcp = 0;
+
+    printf("thread TCP arrete.\n");
+    return NULL;
+}
+
 int beuip_start(const char *pseudo)
 {
-    if (g_udp_actif)
+    if (g_udp_actif || g_tcp_actif)
         return -1;
 
     videListe();
@@ -439,13 +544,23 @@ int beuip_start(const char *pseudo)
     g_udp_pseudo[LPSEUDO] = '\0';
 
     g_stop_udp = 0;
+    g_stop_tcp = 0;
 
     if (pthread_create(&g_th_udp, NULL, serveur_udp, g_udp_pseudo) != 0) {
-        perror("pthread_create");
+        perror("pthread_create UDP");
         return -1;
     }
-
     g_udp_actif = 1;
+
+    if (pthread_create(&g_th_tcp, NULL, serveur_tcp, g_reppub) != 0) {
+        perror("pthread_create TCP");
+        g_stop_udp = 1;
+        pthread_join(g_th_udp, NULL);
+        g_udp_actif = 0;
+        return -1;
+    }
+    g_tcp_actif = 1;
+
     return 0;
 }
 
@@ -455,31 +570,40 @@ int beuip_stop(void)
     struct sockaddr_in Dest;
     struct elt *cour;
 
-    if (!g_udp_actif)
+    if (!g_udp_actif && !g_tcp_actif)
         return -1;
 
-    construire_message(message0, '0', g_udp_pseudo);
+    if (g_udp_actif) {
+        construire_message(message0, '0', g_udp_pseudo);
 
-    pthread_mutex_lock(&mutex_table);
-    cour = liste_contacts;
-    while (cour != NULL) {
-        if (!ip_est_locale(cour->adip)) {
-            memset(&Dest, 0, sizeof(Dest));
-            Dest.sin_family = AF_INET;
-            Dest.sin_port = htons(PORT);
-            Dest.sin_addr.s_addr = inet_addr(cour->adip);
+        pthread_mutex_lock(&mutex_table);
+        cour = liste_contacts;
+        while (cour != NULL) {
+            if (!ip_est_locale(cour->adip)) {
+                memset(&Dest, 0, sizeof(Dest));
+                Dest.sin_family = AF_INET;
+                Dest.sin_port = htons(PORT);
+                Dest.sin_addr.s_addr = inet_addr(cour->adip);
 
-            if (sendto(g_udp_sid, message0, taille_message_beuip(g_udp_pseudo), 0,
-                       (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
-                perror("sendto stop");
+                if (sendto(g_udp_sid, message0, taille_message_beuip(g_udp_pseudo), 0,
+                           (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+                    perror("sendto stop");
+                }
             }
+            cour = cour->next;
         }
-        cour = cour->next;
+        pthread_mutex_unlock(&mutex_table);
     }
-    pthread_mutex_unlock(&mutex_table);
 
     g_stop_udp = 1;
-    pthread_join(g_th_udp, NULL);
+    g_stop_tcp = 1;
+
+    if (g_udp_actif)
+        pthread_join(g_th_udp, NULL);
+
+    if (g_tcp_actif)
+        pthread_join(g_th_tcp, NULL);
+
     videListe();
 
     return 0;
@@ -487,7 +611,7 @@ int beuip_stop(void)
 
 int beuip_actif(void)
 {
-    return g_udp_actif;
+    return (g_udp_actif || g_tcp_actif);
 }
 
 int commande(char octet1, char *message, char *pseudo)

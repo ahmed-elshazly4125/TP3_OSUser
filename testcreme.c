@@ -34,18 +34,18 @@ int main(void)
             }
 
             if (beuip_start(arg1) == -1) {
-                printf("Impossible de lancer le serveur UDP.\n");
+                printf("Impossible de lancer les serveurs.\n");
             } else {
-                printf("Serveur UDP demarre.\n");
+                printf("Serveurs UDP/TCP demarres.\n");
             }
             continue;
         }
 
         if (strcmp(cmd, "stop") == 0) {
             if (beuip_stop() == -1) {
-                printf("Impossible d'arreter le serveur UDP.\n");
+                printf("Impossible d'arreter les serveurs.\n");
             } else {
-                printf("Serveur UDP arrete.\n");
+                printf("Serveurs UDP/TCP arretes.\n");
             }
             continue;
         }
