@@ -12,6 +12,7 @@
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <net/if.h>
+#include <sys/time.h>
 #include "creme.h"
 
 #define PORT 9998
@@ -296,6 +297,7 @@ void *serveur_udp(void *p)
     char *pseudo = (char *)p;
     int sid, n;
     int opt = 1;
+    struct timeval tv;
     char buf[LBUF + 1];
     char reponse[LBUF + 1];
     char *pseudo_recu;
@@ -323,6 +325,12 @@ void *serveur_udp(void *p)
         return NULL;
     }
 
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    if (setsockopt(sid, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
+        perror("setsockopt SO_RCVTIMEO");
+    }
+
     memset(&SockConf, 0, sizeof(SockConf));
     SockConf.sin_family = AF_INET;
     SockConf.sin_port = htons(PORT);
@@ -348,7 +356,6 @@ void *serveur_udp(void *p)
         if (n == -1) {
             if (g_stop_udp)
                 break;
-            perror("recvfrom");
             continue;
         }
 
@@ -472,12 +479,6 @@ int beuip_stop(void)
     pthread_mutex_unlock(&mutex_table);
 
     g_stop_udp = 1;
-
-    if (g_udp_sid != -1) {
-        close(g_udp_sid);
-        g_udp_sid = -1;
-    }
-
     pthread_join(g_th_udp, NULL);
     videListe();
 
