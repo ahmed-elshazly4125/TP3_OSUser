@@ -1,0 +1,7 @@
+*.o
+clibeuip
+cliudp
+servudp
+servbeuip
+testcreme
+testmess
