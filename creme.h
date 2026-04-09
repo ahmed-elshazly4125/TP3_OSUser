@@ -28,7 +28,10 @@ char *chercher_pseudo_par_ip(unsigned long ip);
 
 void *serveur_udp(void *p);
 int beuip_start(const char *pseudo);
+int beuip_stop(void);
 int beuip_actif(void);
+
+int commande(char octet1, char *message, char *pseudo);
 
 int mess_liste(void);
 int mess_msg(const char *pseudo, const char *texte);

@@ -2,20 +2,93 @@
 #include <string.h>
 #include "creme.h"
 
-int main(int N, char *P[])
+#define LBUF 512
+
+int main(void)
 {
-    if (N != 3 || strcmp(P[1], "start") != 0) {
-        fprintf(stderr, "Utilisation : %s start pseudo\n", P[0]);
-        return 1;
-    }
+    char ligne[LBUF + 1];
+    char *cmd;
+    char *arg1;
+    char *arg2;
 
-    if (beuip_start(P[2]) == -1) {
-        fprintf(stderr, "Echec du lancement du thread UDP.\n");
-        return 2;
-    }
+    printf("Mini-biceps TP3\n");
 
-    printf("Thread UDP lance. Appuie sur Entree pour terminer le programme.\n");
-    getchar();
+    for (;;) {
+        printf("tp3> ");
+        fflush(stdout);
+
+        if (fgets(ligne, sizeof(ligne), stdin) == NULL)
+            break;
+
+        ligne[strcspn(ligne, "\n")] = '\0';
+
+        cmd = strtok(ligne, " ");
+        if (cmd == NULL)
+            continue;
+
+        if (strcmp(cmd, "start") == 0) {
+            arg1 = strtok(NULL, " ");
+            if (arg1 == NULL) {
+                printf("Usage: start pseudo\n");
+                continue;
+            }
+
+            if (beuip_start(arg1) == -1) {
+                printf("Impossible de lancer le serveur UDP.\n");
+            } else {
+                printf("Serveur UDP demarre.\n");
+            }
+            continue;
+        }
+
+        if (strcmp(cmd, "stop") == 0) {
+            if (beuip_stop() == -1) {
+                printf("Impossible d'arreter le serveur UDP.\n");
+            } else {
+                printf("Serveur UDP arrete.\n");
+            }
+            continue;
+        }
+
+        if (strcmp(cmd, "liste") == 0) {
+            mess_liste();
+            continue;
+        }
+
+        if (strcmp(cmd, "msg") == 0) {
+            arg1 = strtok(NULL, " ");
+            arg2 = strtok(NULL, "");
+            if (arg1 == NULL || arg2 == NULL) {
+                printf("Usage: msg pseudo message\n");
+                continue;
+            }
+            mess_msg(arg1, arg2);
+            continue;
+        }
+
+        if (strcmp(cmd, "all") == 0) {
+            arg1 = strtok(NULL, "");
+            if (arg1 == NULL) {
+                printf("Usage: all message\n");
+                continue;
+            }
+            mess_all(arg1);
+            continue;
+        }
+
+        if (strcmp(cmd, "actif") == 0) {
+            printf("Serveur actif = %d\n", beuip_actif());
+            continue;
+        }
+
+        if (strcmp(cmd, "quit") == 0) {
+            if (beuip_actif())
+                beuip_stop();
+            break;
+        }
+
+        printf("Commande inconnue.\n");
+    }
 
     return 0;
 }
