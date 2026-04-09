@@ -1,3 +1,6 @@
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -5,6 +8,9 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <net/if.h>
 #include "creme.h"
 
 #define PORT 9998
@@ -140,13 +146,71 @@ char *chercher_pseudo_par_ip(unsigned long ip)
     return NULL;
 }
 
+static void envoie_broadcasts_identification(int sid, const char *pseudo)
+{
+    struct ifaddrs *ifaddr;
+    struct ifaddrs *ifa;
+    char host[NI_MAXHOST];
+    char message[LBUF + 1];
+    struct sockaddr_in Dest;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    construire_message(message, '1', pseudo);
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_broadaddr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        if (!(ifa->ifa_flags & IFF_UP))
+            continue;
+
+        if (!(ifa->ifa_flags & IFF_BROADCAST))
+            continue;
+
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+
+        if (getnameinfo(ifa->ifa_broadaddr,
+                        sizeof(struct sockaddr_in),
+                        host, sizeof(host),
+                        NULL, 0,
+                        NI_NUMERICHOST) != 0) {
+            continue;
+        }
+
+        if (strcmp(host, "127.0.0.1") == 0)
+            continue;
+
+        memset(&Dest, 0, sizeof(Dest));
+        Dest.sin_family = AF_INET;
+        Dest.sin_port = htons(PORT);
+        Dest.sin_addr.s_addr = inet_addr(host);
+
+        if (sendto(sid, message, taille_message_beuip(pseudo), 0,
+                   (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+            perror("sendto broadcast");
+        } else {
+            printf("Broadcast d'identification envoye sur %s -> %s\n",
+                   ifa->ifa_name, host);
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+
 void *serveur_udp(void *p)
 {
     char *pseudo = (char *)p;
     int sid, n;
     int opt = 1;
     char buf[LBUF + 1];
-    char message[LBUF + 1];
     char reponse[LBUF + 1];
     char *pseudo_recu;
     char *texte;
@@ -154,7 +218,6 @@ void *serveur_udp(void *p)
     unsigned long ip_source;
     struct sockaddr_in SockConf;
     struct sockaddr_in Sock;
-    struct sockaddr_in Broadcast;
     socklen_t ls;
 
     if ((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
@@ -186,25 +249,13 @@ void *serveur_udp(void *p)
         return NULL;
     }
 
-    memset(&Broadcast, 0, sizeof(Broadcast));
-    Broadcast.sin_family = AF_INET;
-    Broadcast.sin_port = htons(PORT);
-    Broadcast.sin_addr.s_addr = inet_addr("192.168.88.255");
-
     printf("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
 
     pthread_mutex_lock(&mutex_table);
     ajouter_participant(0x7F000001, pseudo);
     pthread_mutex_unlock(&mutex_table);
 
-    construire_message(message, '1', pseudo);
-
-    if (sendto(sid, message, taille_message_beuip(pseudo), 0,
-               (struct sockaddr *)&Broadcast, sizeof(Broadcast)) == -1) {
-        perror("sendto broadcast");
-    } else {
-        printf("Broadcast d'identification envoye.\n");
-    }
+    envoie_broadcasts_identification(sid, pseudo);
 
     while (!g_stop_udp) {
         ls = sizeof(Sock);
@@ -255,6 +306,7 @@ void *serveur_udp(void *p)
                 printf("Message de %s : %s\n", pseudo_source, texte);
             }
             pthread_mutex_unlock(&mutex_table);
+
             continue;
         }
 
