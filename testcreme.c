@@ -76,6 +76,16 @@ int main(void)
             continue;
         }
 
+        if (strcmp(cmd, "ls") == 0) {
+            arg1 = strtok(NULL, " ");
+            if (arg1 == NULL) {
+                printf("Usage: ls pseudo\n");
+                continue;
+            }
+            demandeListe(arg1);
+            continue;
+        }
+
         if (strcmp(cmd, "actif") == 0) {
             printf("Serveur actif = %d\n", beuip_actif());
             continue;

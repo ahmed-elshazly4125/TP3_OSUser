@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -14,6 +15,7 @@
 #include <net/if.h>
 #include <sys/time.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include "creme.h"
 
 #define PORT 9998
@@ -21,6 +23,8 @@
 
 struct elt *liste_contacts = NULL;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t mutex_aff = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t g_th_udp;
 static pthread_t g_th_tcp;
@@ -36,6 +40,28 @@ static volatile int g_stop_tcp = 0;
 
 static char g_udp_pseudo[LPSEUDO + 1];
 static char g_reppub[256] = "reppub";
+
+static void reaffiche_prompt(void)
+{
+    pthread_mutex_lock(&mutex_aff);
+    printf("tp3> ");
+    fflush(stdout);
+    pthread_mutex_unlock(&mutex_aff);
+}
+
+static void affiche_async(const char *fmt, ...)
+{
+    va_list ap;
+
+    pthread_mutex_lock(&mutex_aff);
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+    pthread_mutex_unlock(&mutex_aff);
+
+    reaffiche_prompt();
+}
 
 char *addrip(unsigned long A)
 {
@@ -168,6 +194,7 @@ void listeElts(void)
     struct elt *cour;
 
     pthread_mutex_lock(&mutex_table);
+    pthread_mutex_lock(&mutex_aff);
 
     printf("---- Liste des contacts ----\n");
     cour = liste_contacts;
@@ -176,7 +203,9 @@ void listeElts(void)
         cour = cour->next;
     }
     printf("----------------------------\n");
+    fflush(stdout);
 
+    pthread_mutex_unlock(&mutex_aff);
     pthread_mutex_unlock(&mutex_table);
 }
 
@@ -294,8 +323,8 @@ static void envoie_broadcasts_identification(int sid, const char *pseudo)
                    (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
             perror("sendto broadcast");
         } else {
-            printf("Broadcast d'identification envoye sur %s -> %s\n",
-                   ifa->ifa_name, host);
+            affiche_async("Broadcast d'identification envoye sur %s -> %s\n",
+                          ifa->ifa_name, host);
         }
     }
 
@@ -354,7 +383,7 @@ void *serveur_udp(void *p)
         return NULL;
     }
 
-    printf("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
+    affiche_async("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
 
     ajouteElt(pseudo, "127.0.0.1");
     envoie_broadcasts_identification(sid, pseudo);
@@ -375,21 +404,22 @@ void *serveur_udp(void *p)
         iptxt[sizeof(iptxt) - 1] = '\0';
 
         if (!message_beuip_valide(buf, n)) {
-            printf("Message ignore : entete invalide\n");
+            affiche_async("Message ignore : entete invalide\n");
             continue;
         }
 
         if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
-            printf("Tentative de piratage ou code non autorise : %c depuis %s\n",
-                   buf[0], iptxt);
+            affiche_async("Tentative de piratage ou code non autorise : %c depuis %s\n",
+                          buf[0], iptxt);
             continue;
         }
 
         if (buf[0] == '0') {
             pseudo_recu = buf + 6;
-            printf("%s (%s) quitte le reseau.\n", pseudo_recu, iptxt);
+            affiche_async("%s (%s) quitte le reseau.\n", pseudo_recu, iptxt);
             supprimeElt(iptxt);
             listeElts();
+            reaffiche_prompt();
             continue;
         }
 
@@ -399,21 +429,26 @@ void *serveur_udp(void *p)
             pthread_mutex_lock(&mutex_table);
             elt_trouve = chercheEltParIp_locked(iptxt);
             if (elt_trouve == NULL) {
-                printf("Message recu d'une IP inconnue (%s) : %s\n",
-                       iptxt, texte);
+                pthread_mutex_unlock(&mutex_table);
+                affiche_async("Message recu d'une IP inconnue (%s) : %s\n",
+                              iptxt, texte);
             } else {
-                printf("Message de %s : %s\n", elt_trouve->nom, texte);
+                char nomtmp[LPSEUDO + 1];
+                strncpy(nomtmp, elt_trouve->nom, LPSEUDO);
+                nomtmp[LPSEUDO] = '\0';
+                pthread_mutex_unlock(&mutex_table);
+                affiche_async("Message de %s : %s\n", nomtmp, texte);
             }
-            pthread_mutex_unlock(&mutex_table);
             continue;
         }
 
         pseudo_recu = buf + 6;
-        printf("Message recu de %s : code=%c pseudo=%s\n",
-               iptxt, buf[0], pseudo_recu);
+        affiche_async("Message recu de %s : code=%c pseudo=%s\n",
+                      iptxt, buf[0], pseudo_recu);
 
         ajouteElt(pseudo_recu, iptxt);
         listeElts();
+        reaffiche_prompt();
 
         if (buf[0] == '1') {
             construire_message(reponse, '2', pseudo);
@@ -422,7 +457,7 @@ void *serveur_udp(void *p)
                        (struct sockaddr *)&Sock, ls) == -1) {
                 perror("sendto AR");
             } else {
-                printf("AR envoye a %s\n", iptxt);
+                affiche_async("AR envoye a %s\n", iptxt);
             }
         }
     }
@@ -434,8 +469,44 @@ void *serveur_udp(void *p)
     g_udp_actif = 0;
     g_stop_udp = 0;
 
-    printf("thread UDP arrete.\n");
+    affiche_async("thread UDP arrete.\n");
     return NULL;
+}
+
+void envoiContenu(int fd)
+{
+    char code;
+    pid_t pid;
+    int status;
+
+    if (read(fd, &code, 1) <= 0) {
+        close(fd);
+        return;
+    }
+
+    if (code == 'L') {
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(fd);
+            return;
+        }
+
+        if (pid == 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+            execlp("ls", "ls", "-l", g_reppub, (char *)NULL);
+            perror("execlp ls");
+            _exit(1);
+        }
+
+        waitpid(pid, &status, 0);
+        close(fd);
+        return;
+    }
+
+    close(fd);
 }
 
 void *serveur_tcp(void *rep)
@@ -482,8 +553,8 @@ void *serveur_tcp(void *rep)
         return NULL;
     }
 
-    printf("thread TCP lance sur le port %d avec le repertoire %s\n",
-           PORT, repertoire);
+    affiche_async("thread TCP lance sur le port %d avec le repertoire %s\n",
+                  PORT, repertoire);
 
     while (!g_stop_tcp) {
         FD_ZERO(&rset);
@@ -517,8 +588,8 @@ void *serveur_tcp(void *rep)
                 strcpy(ipcli, "inconnue");
             }
 
-            printf("Connexion TCP acceptee depuis %s\n", ipcli);
-            close(fd);
+            affiche_async("Connexion TCP acceptee depuis %s\n", ipcli);
+            envoiContenu(fd);
         }
     }
 
@@ -529,8 +600,62 @@ void *serveur_tcp(void *rep)
     g_tcp_actif = 0;
     g_stop_tcp = 0;
 
-    printf("thread TCP arrete.\n");
+    affiche_async("thread TCP arrete.\n");
     return NULL;
+}
+
+int demandeListe(char *pseudo)
+{
+    int sid, n;
+    char ipdest[16];
+    char code = 'L';
+    char buf[LBUF];
+    struct sockaddr_in Dest;
+    struct elt *cour;
+
+    if (pseudo == NULL)
+        return -1;
+
+    pthread_mutex_lock(&mutex_table);
+    cour = chercheEltParNom_locked(pseudo);
+    if (cour == NULL) {
+        pthread_mutex_unlock(&mutex_table);
+        printf("Pseudo inconnu : %s\n", pseudo);
+        return -1;
+    }
+
+    strncpy(ipdest, cour->adip, sizeof(ipdest) - 1);
+    ipdest[sizeof(ipdest) - 1] = '\0';
+    pthread_mutex_unlock(&mutex_table);
+
+    if ((sid = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket TCP client");
+        return -1;
+    }
+
+    memset(&Dest, 0, sizeof(Dest));
+    Dest.sin_family = AF_INET;
+    Dest.sin_port = htons(PORT);
+    Dest.sin_addr.s_addr = inet_addr(ipdest);
+
+    if (connect(sid, (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+        perror("connect");
+        close(sid);
+        return -1;
+    }
+
+    if (write(sid, &code, 1) != 1) {
+        perror("write");
+        close(sid);
+        return -1;
+    }
+
+    while ((n = read(sid, buf, sizeof(buf))) > 0) {
+        write(STDOUT_FILENO, buf, n);
+    }
+
+    close(sid);
+    return 0;
 }
 
 int beuip_start(const char *pseudo)
