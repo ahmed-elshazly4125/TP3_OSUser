@@ -16,6 +16,8 @@
 #include <sys/time.h>
 #include <sys/select.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "creme.h"
 
 #define PORT 9998
@@ -54,14 +56,23 @@ static void affiche_async(const char *fmt, ...)
     va_list ap;
 
     pthread_mutex_lock(&mutex_aff);
+    printf("\n");
     va_start(ap, fmt);
     vprintf(fmt, ap);
     va_end(ap);
     fflush(stdout);
     pthread_mutex_unlock(&mutex_aff);
-
-    reaffiche_prompt();
 }
+
+#ifdef TRACE
+#define TRACEF(...)                  \
+    do {                            \
+        affiche_async(__VA_ARGS__); \
+        reaffiche_prompt();         \
+    } while (0)
+#else
+#define TRACEF(...)
+#endif
 
 char *addrip(unsigned long A)
 {
@@ -95,6 +106,26 @@ void construire_message(char *dest, char code, const char *pseudo)
 int taille_message_beuip(const char *pseudo)
 {
     return 6 + strlen(pseudo) + 1;
+}
+
+static int assure_reppub(void)
+{
+    struct stat st;
+
+    if (stat(g_reppub, &st) == -1) {
+        if (mkdir(g_reppub, 0775) == -1) {
+            perror("mkdir reppub");
+            return -1;
+        }
+        return 0;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "%s existe mais n'est pas un repertoire\n", g_reppub);
+        return -1;
+    }
+
+    return 0;
 }
 
 static void videListe(void)
@@ -323,8 +354,8 @@ static void envoie_broadcasts_identification(int sid, const char *pseudo)
                    (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
             perror("sendto broadcast");
         } else {
-            affiche_async("Broadcast d'identification envoye sur %s -> %s\n",
-                          ifa->ifa_name, host);
+            TRACEF("Broadcast d'identification envoye sur %s -> %s\n",
+                   ifa->ifa_name, host);
         }
     }
 
@@ -383,7 +414,7 @@ void *serveur_udp(void *p)
         return NULL;
     }
 
-    affiche_async("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
+    TRACEF("thread UDP lance sur le port %d avec le pseudo %s\n", PORT, pseudo);
 
     ajouteElt(pseudo, "127.0.0.1");
     envoie_broadcasts_identification(sid, pseudo);
@@ -405,12 +436,14 @@ void *serveur_udp(void *p)
 
         if (!message_beuip_valide(buf, n)) {
             affiche_async("Message ignore : entete invalide\n");
+            reaffiche_prompt();
             continue;
         }
 
         if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
             affiche_async("Tentative de piratage ou code non autorise : %c depuis %s\n",
                           buf[0], iptxt);
+            reaffiche_prompt();
             continue;
         }
 
@@ -439,12 +472,13 @@ void *serveur_udp(void *p)
                 pthread_mutex_unlock(&mutex_table);
                 affiche_async("Message de %s : %s\n", nomtmp, texte);
             }
+            reaffiche_prompt();
             continue;
         }
 
         pseudo_recu = buf + 6;
-        affiche_async("Message recu de %s : code=%c pseudo=%s\n",
-                      iptxt, buf[0], pseudo_recu);
+        TRACEF("Message recu de %s : code=%c pseudo=%s\n",
+               iptxt, buf[0], pseudo_recu);
 
         ajouteElt(pseudo_recu, iptxt);
         listeElts();
@@ -457,7 +491,7 @@ void *serveur_udp(void *p)
                        (struct sockaddr *)&Sock, ls) == -1) {
                 perror("sendto AR");
             } else {
-                affiche_async("AR envoye a %s\n", iptxt);
+                TRACEF("AR envoye a %s\n", iptxt);
             }
         }
     }
@@ -469,13 +503,17 @@ void *serveur_udp(void *p)
     g_udp_actif = 0;
     g_stop_udp = 0;
 
-    affiche_async("thread UDP arrete.\n");
+    TRACEF("thread UDP arrete.\n");
     return NULL;
 }
 
 void envoiContenu(int fd)
 {
     char code;
+    char nomfic[256];
+    char path[512];
+    ssize_t nr;
+    int i;
     pid_t pid;
     int status;
 
@@ -498,6 +536,58 @@ void envoiContenu(int fd)
             close(fd);
             execlp("ls", "ls", "-l", g_reppub, (char *)NULL);
             perror("execlp ls");
+            _exit(1);
+        }
+
+        waitpid(pid, &status, 0);
+        close(fd);
+        return;
+    }
+
+    if (code == 'F') {
+        i = 0;
+        while (i < (int)sizeof(nomfic) - 1) {
+            nr = read(fd, &nomfic[i], 1);
+            if (nr <= 0)
+                break;
+            if (nomfic[i] == '\n')
+                break;
+            i++;
+        }
+        nomfic[i] = '\0';
+
+        if (i == 0 || strchr(nomfic, '/') != NULL || strstr(nomfic, "..") != NULL) {
+            write(fd, "ERR nom de fichier invalide\n", 28);
+            close(fd);
+            return;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", g_reppub, nomfic);
+
+        if (access(path, R_OK) != 0) {
+            write(fd, "ERR fichier introuvable\n", 24);
+            close(fd);
+            return;
+        }
+
+        if (write(fd, "OK\n", 3) != 3) {
+            close(fd);
+            return;
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(fd);
+            return;
+        }
+
+        if (pid == 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+            execlp("cat", "cat", path, (char *)NULL);
+            perror("execlp cat");
             _exit(1);
         }
 
@@ -553,8 +643,8 @@ void *serveur_tcp(void *rep)
         return NULL;
     }
 
-    affiche_async("thread TCP lance sur le port %d avec le repertoire %s\n",
-                  PORT, repertoire);
+    TRACEF("thread TCP lance sur le port %d avec le repertoire %s\n",
+           PORT, repertoire);
 
     while (!g_stop_tcp) {
         FD_ZERO(&rset);
@@ -588,7 +678,7 @@ void *serveur_tcp(void *rep)
                 strcpy(ipcli, "inconnue");
             }
 
-            affiche_async("Connexion TCP acceptee depuis %s\n", ipcli);
+            TRACEF("Connexion TCP acceptee depuis %s\n", ipcli);
             envoiContenu(fd);
         }
     }
@@ -600,7 +690,7 @@ void *serveur_tcp(void *rep)
     g_tcp_actif = 0;
     g_stop_tcp = 0;
 
-    affiche_async("thread TCP arrete.\n");
+    TRACEF("thread TCP arrete.\n");
     return NULL;
 }
 
@@ -658,9 +748,122 @@ int demandeListe(char *pseudo)
     return 0;
 }
 
+int demandeFichier(char *pseudo, char *nomfic)
+{
+    int sid, fd, n, i;
+    char ipdest[16];
+    char req[512];
+    char ligne[256];
+    char c;
+    char buf[LBUF];
+    char path[512];
+    struct sockaddr_in Dest;
+    struct elt *cour;
+
+    if (pseudo == NULL || nomfic == NULL)
+        return -1;
+
+    if (strchr(nomfic, '/') != NULL || strstr(nomfic, "..") != NULL) {
+        printf("Nom de fichier invalide.\n");
+        return -1;
+    }
+
+    if (assure_reppub() == -1)
+        return -1;
+
+    snprintf(path, sizeof(path), "%s/%s", g_reppub, nomfic);
+
+    if (access(path, F_OK) == 0) {
+        printf("Fichier local deja present : %s\n", path);
+        return -1;
+    }
+
+    pthread_mutex_lock(&mutex_table);
+    cour = chercheEltParNom_locked(pseudo);
+    if (cour == NULL) {
+        pthread_mutex_unlock(&mutex_table);
+        printf("Pseudo inconnu : %s\n", pseudo);
+        return -1;
+    }
+
+    strncpy(ipdest, cour->adip, sizeof(ipdest) - 1);
+    ipdest[sizeof(ipdest) - 1] = '\0';
+    pthread_mutex_unlock(&mutex_table);
+
+    if ((sid = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket TCP client");
+        return -1;
+    }
+
+    memset(&Dest, 0, sizeof(Dest));
+    Dest.sin_family = AF_INET;
+    Dest.sin_port = htons(PORT);
+    Dest.sin_addr.s_addr = inet_addr(ipdest);
+
+    if (connect(sid, (struct sockaddr *)&Dest, sizeof(Dest)) == -1) {
+        perror("connect");
+        close(sid);
+        return -1;
+    }
+
+    snprintf(req, sizeof(req), "F%s\n", nomfic);
+
+    if (write(sid, req, strlen(req)) != (ssize_t)strlen(req)) {
+        perror("write");
+        close(sid);
+        return -1;
+    }
+
+    i = 0;
+    while (i < (int)sizeof(ligne) - 1) {
+        n = read(sid, &c, 1);
+        if (n <= 0)
+            break;
+        if (c == '\n')
+            break;
+        ligne[i++] = c;
+    }
+    ligne[i] = '\0';
+
+    if (strcmp(ligne, "OK") != 0) {
+        if (ligne[0] == '\0')
+            printf("Erreur distante ou connexion fermee.\n");
+        else
+            printf("%s\n", ligne);
+        close(sid);
+        return -1;
+    }
+
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0664);
+    if (fd == -1) {
+        perror("open local");
+        close(sid);
+        return -1;
+    }
+
+    while ((n = read(sid, buf, sizeof(buf))) > 0) {
+        if (write(fd, buf, n) != n) {
+            perror("write local");
+            close(fd);
+            close(sid);
+            unlink(path);
+            return -1;
+        }
+    }
+
+    close(fd);
+    close(sid);
+
+    printf("Fichier recu dans %s\n", path);
+    return 0;
+}
+
 int beuip_start(const char *pseudo)
 {
     if (g_udp_actif || g_tcp_actif)
+        return -1;
+
+    if (assure_reppub() == -1)
         return -1;
 
     videListe();
