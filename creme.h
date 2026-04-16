@@ -29,6 +29,7 @@ void *serveur_tcp(void *rep);
 
 void envoiContenu(int fd);
 int demandeListe(char *pseudo);
+int demandeFichier(char *pseudo, char *nomfic);
 
 int beuip_start(const char *pseudo);
 int beuip_stop(void);
