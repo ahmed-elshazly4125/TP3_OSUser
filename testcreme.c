@@ -86,6 +86,17 @@ int main(void)
             continue;
         }
 
+        if (strcmp(cmd, "get") == 0) {
+            arg1 = strtok(NULL, " ");
+            arg2 = strtok(NULL, " ");
+            if (arg1 == NULL || arg2 == NULL) {
+                printf("Usage: get pseudo nomfic\n");
+                continue;
+            }
+            demandeFichier(arg1, arg2);
+            continue;
+        }
+
         if (strcmp(cmd, "actif") == 0) {
             printf("Serveur actif = %d\n", beuip_actif());
             continue;
