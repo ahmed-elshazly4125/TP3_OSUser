@@ -20,3 +20,7 @@ testmess: testmess.c creme.c creme.h
 
 clean:
 	rm -f servudp cliudp clibeuip testcreme testmess *.o
+
+trace:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -DTRACE"
